@@ -931,12 +931,6 @@ def main():
                 
             overlay = draw_face_detection_step(frame, landmarks, face_detected, vault_status, trust_score, face_count)
             show_fullscreen("PHOTON_ID", overlay)
-            
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord(' ') and face_detected and face_count == 1:
-                current_step = Step.INSTRUCTION
-                step_start_time = time.perf_counter()
-                print("✓ Step 1 Complete: Face detected")
         
         # ====================================================================
         # STEP 2: INSTRUCTION
@@ -986,9 +980,8 @@ def main():
         # ====================================================================
         elif current_step == Step.PROCESSING:
             show_fullscreen("PHOTON_ID", draw_knox_processing(frame))
-            cv2.waitKey(1)
             
-            if time.time() - step_start_time > 0.8:
+            if time.perf_counter() - step_start_time > 0.8:
                 engine.generate_secure_packet()
                 print("\n[KNOX] Telemetry Signed via TrustZone.")
                 print(json.dumps(engine.secure_packet, indent=2))
@@ -1007,14 +1000,25 @@ def main():
             # --------------------------
 
             show_fullscreen("PHOTON_ID", draw_complete_step(frame, engine))
-            if cv2.waitKey(1) == ord('r'):
+        
+        # Centralized key handling
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            break
+            
+        if current_step == Step.FACE_DETECTION:
+            if key == ord(' ') and face_detected and face_count == 1:
+                current_step = Step.INSTRUCTION
+                step_start_time = time.perf_counter()
+                print("✓ Step 1 Complete: Face detected")
+                
+        elif current_step == Step.COMPLETE:
+            if key == ord('r'):
                 current_step = Step.FACE_DETECTION
                 engine.reset()
                 face_detected_count = 0
                 print("\n→ Restarting verification process...")
-        
-        if cv2.waitKey(1) == ord('q'):
-            break
 
     cam.stop()
     cv2.destroyAllWindows()
