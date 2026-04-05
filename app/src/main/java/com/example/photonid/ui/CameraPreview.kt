@@ -14,31 +14,21 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.example.photonid.camera.AnalysisResult
 import com.example.photonid.camera.CameraAnalyzer
-import com.example.photonid.camera.ManualCameraHelper
 import java.util.concurrent.Executors
 
 @Composable
 fun CameraPreview(
-    iso: Float,
-    exposure: Float,
-    isSmartAeEnabled: Boolean,
-    onIrisDetected: (Triple<Int, Int, Int>) -> Unit,
-    onSmartIsoChange: (Float) -> Unit
+    onResult: (AnalysisResult) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val executor = remember { Executors.newSingleThreadExecutor() }
-    val smartController = remember { SmartExposureController() }
-    
-    // Keep track of the camera control to update manual settings
-    var cameraControl by remember { mutableStateOf<androidx.camera.core.CameraControl?>(null) }
 
-    // Update manual controls when sliders change OR Smart AE changes
-    LaunchedEffect(iso, exposure, cameraControl) {
-        val control = cameraControl
-        if (control != null) {
-            ManualCameraHelper.setManualControls(control, iso.toInt(), exposure)
+    DisposableEffect(Unit) {
+        onDispose {
+            executor.shutdown()
         }
     }
 
@@ -46,31 +36,26 @@ fun CameraPreview(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
             val previewView = PreviewView(ctx)
-            
+
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
-                
+
                 val preview = Preview.Builder().build()
                 preview.setSurfaceProvider(previewView.surfaceProvider)
 
                 val imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(640, 480)) // Lower res for performance
+                    .setTargetResolution(Size(640, 480))
                     .build()
-                
-                imageAnalysis.setAnalyzer(executor, CameraAnalyzer { irisColor, faceBrightness ->
-                    onIrisDetected(irisColor)
-                    
-                    if (isSmartAeEnabled) {
-                        val newIso = smartController.calculateNewIso(faceBrightness, iso.toInt())
-                        if (newIso != null) {
-                            onSmartIsoChange(newIso.toFloat())
-                        }
-                    }
-                })
 
-                // Select Front camera for self-testing (looking at screen)
+                val analyzer = CameraAnalyzer(ctx) { result ->
+                    onResult(result)
+                }
+
+                imageAnalysis.setAnalyzer(executor, analyzer)
+
+                // Front camera for self-testing
                 val cameraSelector = if (cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
                     CameraSelector.DEFAULT_FRONT_CAMERA
                 } else {
@@ -79,13 +64,12 @@ fun CameraPreview(
 
                 try {
                     cameraProvider.unbindAll()
-                    val camera = cameraProvider.bindToLifecycle(
+                    cameraProvider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
                         preview,
                         imageAnalysis
                     )
-                    cameraControl = camera.cameraControl
                 } catch (e: Exception) {
                     Log.e("CameraPreview", "Binding failed", e)
                 }

@@ -1,94 +1,86 @@
 package com.example.photonid.camera
 
+import android.content.Context
 import android.graphics.ImageFormat
-import android.graphics.Rect
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.facemesh.FaceMeshDetection
-import com.google.mlkit.vision.facemesh.FaceMeshDetectorOptions
-import com.google.mlkit.vision.facemesh.FaceMeshPoint
-import java.nio.ByteBuffer
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.MPImage
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
+import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerOptions
 import kotlin.math.max
 import kotlin.math.min
 
+/**
+ * Result data from a single frame analysis.
+ *
+ * @param glintRgb     [R, G, B] from the brightest corneal glint region
+ * @param landmarkXs   Normalized X coordinates of all 478 landmarks
+ * @param landmarkYs   Normalized Y coordinates of all 478 landmarks
+ * @param faceBrightness Average Y-channel brightness in the face region (0–255)
+ * @param faceDetected  Whether a face was found
+ */
+data class AnalysisResult(
+    val glintRgb: FloatArray,
+    val landmarkXs: List<Float>,
+    val landmarkYs: List<Float>,
+    val faceBrightness: Int,
+    val faceDetected: Boolean,
+    val faceCount: Int = 0,
+    val multiFaceRejected: Boolean = false
+)
+
+/**
+ * CameraX ImageAnalysis.Analyzer that uses MediaPipe Face Landmarker
+ * with iris refinement to extract corneal glint colors.
+ */
 class CameraAnalyzer(
-    private val onIrisDetected: (irisColor: Triple<Int, Int, Int>, faceBrightness: Int) -> Unit
+    context: Context,
+    private val onResult: (AnalysisResult) -> Unit
 ) : ImageAnalysis.Analyzer {
 
-    // ... (rest of class) ...
-
-    // Helper to get simple Y channel brightness
-    private fun getAverageBrightness(
-        image: ImageProxy,
-        centerX: Float,
-        centerY: Float,
-        radius: Int,
-        rotation: Int
-    ): Int {
-         val yPlane = image.planes[0].buffer
-         val width = image.width
-         val height = image.height
-         
-         var bufX = centerX.toInt()
-         var bufY = centerY.toInt()
-
-         when (rotation) {
-             90 -> {
-                 bufX = centerY.toInt()
-                 bufY = width - centerX.toInt()
-             }
-             270 -> {
-                 bufX = height - centerY.toInt()
-                 bufY = centerX.toInt()
-             }
-             180 -> {
-                 bufX = width - centerX.toInt()
-                 bufY = height - centerY.toInt()
-             }
-         }
-         
-         val startX = max(0, bufX - radius)
-         val endX = min(width - 1, bufX + radius)
-         val startY = max(0, bufY - radius)
-         val endY = min(height - 1, bufY + radius)
-
-         var sumY = 0L
-         var count = 0
-         val yRowStride = image.planes[0].rowStride
-         val yPixelStride = image.planes[0].pixelStride // usually 1
-
-         // Optimization: Sample every 4th pixel for speed
-         for (y in startY..endY step 4) {
-             for (x in startX..endX step 4) {
-                 val yIdx = y * yRowStride + x * yPixelStride
-                 val Y = (yPlane.get(yIdx).toInt() and 0xFF)
-                 sumY += Y
-                 count++
-             }
-         }
-         
-         return if (count > 0) (sumY / count).toInt() else 0
+    companion object {
+        private const val TAG = "CameraAnalyzer"
+        private const val MODEL_ASSET = "face_landmarker.task"
+        private const val GLINT_RADIUS = 12
+        // Iris landmark indices (MediaPipe with refine_landmarks=true)
+        private const val LEFT_IRIS = 468
+        private const val RIGHT_IRIS = 473
     }
 
-    private fun getAverageColor(
-    // ...
-
-    private val detector = FaceMeshDetection.getClient(
-        FaceMeshDetectorOptions.Builder()
-            .setUseCase(FaceMeshDetectorOptions.FACE_MESH)
-            .build()
-    )
-
+    private var faceLandmarker: FaceLandmarker? = null
     private var lastProcessTime = 0L
+
+    init {
+        try {
+            val options = FaceLandmarkerOptions.builder()
+                .setBaseOptions(
+                    BaseOptions.builder()
+                        .setModelAssetPath(MODEL_ASSET)
+                        .build()
+                )
+                .setRunningMode(RunningMode.IMAGE)
+                .setNumFaces(3)  // detect up to 3 for multi-face rejection
+                .setMinFaceDetectionConfidence(0.5f)
+                .setMinTrackingConfidence(0.5f)
+                .build()
+
+            faceLandmarker = FaceLandmarker.createFromOptions(context, options)
+            Log.i(TAG, "FaceLandmarker initialized")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to init FaceLandmarker", e)
+        }
+    }
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
         val currentTime = System.currentTimeMillis()
-        // Throttle to ~20FPS processing to avoid overheating
+        // Throttle to ~20 FPS
         if (currentTime - lastProcessTime < 50) {
             imageProxy.close()
             return
@@ -96,169 +88,192 @@ class CameraAnalyzer(
         lastProcessTime = currentTime
 
         val mediaImage = imageProxy.image
-        if (mediaImage != null && mediaImage.format == ImageFormat.YUV_420_888) {
-            val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-            
-            detector.process(inputImage)
-                .addOnSuccessListener { faceMeshes ->
-                    if (faceMeshes.isNotEmpty()) {
-                        val faceMesh = faceMeshes[0]
-                        
-                        // Right Iris indices: 474, 475, 476, 477 (Approximation or specific landmarks)
-                        // ML Kit Face Mesh standard 468 points.
-                        // Right Iris center is often approximated. 
-                        // We will use the Eye region points to define a bounding box.
-                        // Right eye bounding box points: 33, 133 (corners).
-                        // Better: Use specific Iris points if available or estimate from eye center.
-                        // For simplicity in this prototype, we'll take the center of the Right Eye.
-                        
-                        // Right eye center approx: index 468 (Right Iris Center) is only available in some models?
-                        // Actually standard 468 mesh: 
-                        // Right Eye: 362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398
-                        // We can just average the eye points to get the center.
-                        
-                        // BUT, to see reflection, we need the IRIS.
-                        // Let's use landmark 473 (Left Iris) and 468 (Right Iris) if available? 
-                        // The default model might not support refined iris.
-                        // Let's safe-bet on averaging points 362 and 263 (corners of right eye) to get center, 
-                        // and take a small box around it.
-                        
-                        val rightEyeCorner1 = faceMesh.getPoints(362).firstOrNull()
-                        val rightEyeCorner2 = faceMesh.getPoints(263).firstOrNull()
+        if (mediaImage == null || mediaImage.format != ImageFormat.YUV_420_888) {
+            imageProxy.close()
+            return
+        }
 
-                        if (rightEyeCorner1 != null && rightEyeCorner2 != null) {
-                            val centerX = (rightEyeCorner1.position.x + rightEyeCorner2.position.x) / 2
-                            val centerY = (rightEyeCorner1.position.y + rightEyeCorner2.position.y) / 2
-                            
-                            // Iris Analysis
-                            val avgColor = getAverageColor(
-                                imageProxy, 
-                                centerX, 
-                                centerY, 
-                                radius = 10, 
-                                rotation = imageProxy.imageInfo.rotationDegrees
-                            )
-                            
-                            // Face Brightness Analysis (using the Face Bounding Box)
-                            // We can use the face bounding box to sample brightness
-                            val faceBox = faceMesh.boundingBox
-                            // Map center of face to image coordinates?
-                            // Simplified: Just use the center of the face mesh (approx nose)
-                            val nose = faceMesh.getPoints(1).firstOrNull() // Tip of nose
-                            val faceBrightness = if (nose != null) {
-                                getAverageBrightness(
-                                    imageProxy,
-                                    nose.position.x,
-                                    nose.position.y,
-                                    radius = 50, // Larger area for face
-                                    rotation = imageProxy.imageInfo.rotationDegrees
-                                )
-                            } else {
-                                0 // Default
-                            }
+        val landmarker = faceLandmarker
+        if (landmarker == null) {
+            imageProxy.close()
+            return
+        }
 
-                            onIrisDetected(avgColor, faceBrightness)
-                        }
-                    }
+        try {
+            // Convert YUV to Bitmap for MediaPipe
+            val bitmap = imageProxy.toBitmap()
+            val mpImage = BitmapImageBuilder(bitmap).build()
+
+            val result = landmarker.detect(mpImage)
+            val faceCount = result.faceLandmarks().size
+
+            if (faceCount > 0) {
+                // ── MULTI-FACE REJECTION ────────────────────────────
+                if (faceCount > 1) {
+                    onResult(
+                        AnalysisResult(
+                            glintRgb = floatArrayOf(0f, 0f, 0f),
+                            landmarkXs = emptyList(),
+                            landmarkYs = emptyList(),
+                            faceBrightness = 0,
+                            faceDetected = true,
+                            faceCount = faceCount,
+                            multiFaceRejected = true
+                        )
+                    )
+                } else {
+
+                val landmarks = result.faceLandmarks()[0]
+
+                val xs = landmarks.map { it.x() }
+                val ys = landmarks.map { it.y() }
+
+                val width = bitmap.width
+                val height = bitmap.height
+
+                // Extract corneal glint RGB from iris regions
+                val glintRgb = extractGlintRgb(bitmap, landmarks, width, height)
+
+                // Face brightness from nose region
+                val noseX = (landmarks[1].x() * width).toInt().coerceIn(0, width - 1)
+                val noseY = (landmarks[1].y() * height).toInt().coerceIn(0, height - 1)
+                val faceBrightness = getRegionBrightness(bitmap, noseX, noseY, 50)
+
+                    onResult(
+                        AnalysisResult(
+                            glintRgb = glintRgb,
+                            landmarkXs = xs,
+                            landmarkYs = ys,
+                            faceBrightness = faceBrightness,
+                            faceDetected = true,
+                            faceCount = 1,
+                            multiFaceRejected = false
+                        )
+                    )
                 }
-                .addOnFailureListener { e ->
-                    Log.e("CameraAnalyzer", "Face detection failed", e)
-                }
-                .addOnCompleteListener {
-                    imageProxy.close()
-                }
-        } else {
+            } else {
+                onResult(
+                    AnalysisResult(
+                        glintRgb = floatArrayOf(0f, 0f, 0f),
+                        landmarkXs = emptyList(),
+                        landmarkYs = emptyList(),
+                        faceBrightness = 0,
+                        faceDetected = false,
+                        faceCount = 0,
+                        multiFaceRejected = false
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Analysis error", e)
+        } finally {
             imageProxy.close()
         }
     }
 
-    private fun getAverageColor(
-        image: ImageProxy,
-        centerX: Float,
-        centerY: Float,
-        radius: Int,
-        rotation: Int
-    ): Triple<Int, Int, Int> {
-        val yPlane = image.planes[0].buffer
-        val uPlane = image.planes[1].buffer
-        val vPlane = image.planes[2].buffer
+    /**
+     * Extract brightest corneal glint colour from both eyes.
+     * Uses MediaPipe iris landmarks (468 = left iris, 473 = right iris).
+     * Returns [R, G, B] for the eye with stronger signal.
+     */
+    private fun extractGlintRgb(
+        bitmap: android.graphics.Bitmap,
+        landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>,
+        w: Int,
+        h: Int
+    ): FloatArray {
+        var bestRgb = floatArrayOf(0f, 0f, 0f)
+        var bestSum = 0f
 
-        val width = image.width
-        val height = image.height
-        
-        // Map logical coordinates to buffer coordinates based on rotation
-        // ImageProxy buffer is always unrotated (landscape usually).
-        // InputImage coordinates are rotated.
-        
-        var bufX = centerX.toInt()
-        var bufY = centerY.toInt()
+        for (idx in listOf(LEFT_IRIS, RIGHT_IRIS)) {
+            if (idx >= landmarks.size) continue
 
-        when (rotation) {
-            90 -> {
-                bufX = centerY.toInt()
-                bufY = width - centerX.toInt()
+            val lm = landmarks[idx]
+            val cx = (lm.x() * w).toInt()
+            val cy = (lm.y() * h).toInt()
+            val x1 = max(0, cx - GLINT_RADIUS)
+            val x2 = min(w - 1, cx + GLINT_RADIUS)
+            val y1 = max(0, cy - GLINT_RADIUS)
+            val y2 = min(h - 1, cy + GLINT_RADIUS)
+
+            if (x2 <= x1 || y2 <= y1) continue
+
+            // Extract pixel data from ROI
+            val roiW = x2 - x1 + 1
+            val roiH = y2 - y1 + 1
+            val pixels = IntArray(roiW * roiH)
+            bitmap.getPixels(pixels, 0, roiW, x1, y1, roiW, roiH)
+
+            // Calculate brightness (grayscale) for each pixel
+            val brightness = pixels.map { pixel ->
+                val r = (pixel shr 16) and 0xFF
+                val g = (pixel shr 8) and 0xFF
+                val b = pixel and 0xFF
+                (r + g + b) / 3
             }
-            270 -> {
-                bufX = height - centerY.toInt()
-                bufY = centerX.toInt()
+
+            // Top 10% brightness mask (90th percentile)
+            val sorted = brightness.sorted()
+            val threshold = sorted[(sorted.size * 0.9).toInt().coerceIn(0, sorted.size - 1)]
+
+            var sumR = 0f; var sumG = 0f; var sumB = 0f; var count = 0
+            for (i in pixels.indices) {
+                if (brightness[i] >= threshold) {
+                    sumR += (pixels[i] shr 16) and 0xFF
+                    sumG += (pixels[i] shr 8) and 0xFF
+                    sumB += pixels[i] and 0xFF
+                    count++
+                }
             }
-            180 -> {
-                bufX = width - centerX.toInt()
-                bufY = height - centerY.toInt()
-            }
-        }
-        
-        // Boundaries
-        val startX = max(0, bufX - radius)
-        val endX = min(width - 1, bufX + radius)
-        val startY = max(0, bufY - radius)
-        val endY = min(height - 1, bufY + radius)
 
-        var sumR = 0L
-        var sumG = 0L
-        var sumB = 0L
-        var count = 0
+            if (count == 0) continue
 
-        // YUV NV21 layout hypothesis (standard for Camera2 usually) or YUV_420_888
-        // Y plane stride
-        val yRowStride = image.planes[0].rowStride
-        val yPixelStride = image.planes[0].pixelStride // usually 1
-        
-        val uvRowStride = image.planes[1].rowStride
-        val uvPixelStride = image.planes[1].pixelStride
-
-        for (y in startY..endY) {
-            for (x in startX..endX) {
-                // Y Index
-                val yIdx = y * yRowStride + x * yPixelStride
-                val Y = (yPlane.get(yIdx).toInt() and 0xFF)
-
-                // UV Index (subsampled 2x2)
-                val uvX = x / 2
-                val uvY = y / 2
-                val uvIdx = uvY * uvRowStride + uvX * uvPixelStride
-                
-                // V is usually first in NV21? 
-                // For YUV_420_888, planes[1] is U, planes[2] is V.
-                val U = (uPlane.get(uvIdx).toInt() and 0xFF) - 128
-                val V = (vPlane.get(uvIdx).toInt() and 0xFF) - 128
-
-                // YUV to RGB Conversion
-                val R = (Y + 1.370705 * V).toInt().coerceIn(0, 255)
-                val G = (Y - 0.337633 * U - 0.698001 * V).toInt().coerceIn(0, 255)
-                val B = (Y + 1.732446 * U).toInt().coerceIn(0, 255)
-
-                sumR += R
-                sumG += G
-                sumB += B
-                count++
+            val rgb = floatArrayOf(sumR / count, sumG / count, sumB / count)
+            val s = rgb.sum()
+            if (s > bestSum) {
+                bestSum = s
+                bestRgb = rgb
             }
         }
 
-        return if (count > 0) {
-            Triple((sumR / count).toInt(), (sumG / count).toInt(), (sumB / count).toInt())
-        } else {
-            Triple(0, 0, 0)
+        return bestRgb
+    }
+
+    /**
+     * Get average brightness (0–255) in a square region around (cx, cy).
+     */
+    private fun getRegionBrightness(
+        bitmap: android.graphics.Bitmap,
+        cx: Int,
+        cy: Int,
+        radius: Int
+    ): Int {
+        val x1 = max(0, cx - radius)
+        val x2 = min(bitmap.width - 1, cx + radius)
+        val y1 = max(0, cy - radius)
+        val y2 = min(bitmap.height - 1, cy + radius)
+
+        if (x2 <= x1 || y2 <= y1) return 0
+
+        val w = x2 - x1 + 1
+        val h = y2 - y1 + 1
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, x1, y1, w, h)
+
+        // Sample every 4th pixel for speed
+        var sum = 0L; var count = 0
+        for (i in pixels.indices step 4) {
+            val r = (pixels[i] shr 16) and 0xFF
+            val g = (pixels[i] shr 8) and 0xFF
+            val b = pixels[i] and 0xFF
+            sum += (r + g + b) / 3
+            count++
         }
+
+        return if (count > 0) (sum / count).toInt() else 0
+    }
+
+    fun close() {
+        faceLandmarker?.close()
     }
 }
